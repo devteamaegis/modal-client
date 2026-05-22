@@ -159,6 +159,28 @@ async def _upload_to_s3_url(
             return remote_md5
 
 
+@retry(n_attempts=5, base_delay=1.0, delay_factor=2, max_delay=30, attempt_timeout=None)
+async def _complete_multipart_upload(completion_url: str, completion_body: str, expected_etag: str) -> None:
+    """POST the CompleteMultipartUpload request to S3, with retry on 503 SlowDown."""
+    async with ClientSessionRegistry.get_session().post(
+        completion_url, data=completion_body.encode("ascii"), skip_auto_headers=["content-type"]
+    ) as resp:
+        if resp.status == 503:
+            logger.debug("Received SlowDown signal from S3, sleeping before retrying multipart upload completion.")
+            await asyncio.sleep(1)
+        if resp.status != 200:
+            try:
+                msg = await resp.text()
+            except Exception:
+                msg = "<no body>"
+            raise ExecutionError(f"Error when completing multipart upload: {resp.status}\n{msg}")
+        response_body = await resp.text()
+        if expected_etag not in response_body:
+            raise ExecutionError(
+                f"Hash mismatch on multipart upload assembly: {expected_etag} not in {response_body}"
+            )
+
+
 async def perform_multipart_upload(
     data_file: Union[BinaryIO, BytesIO, FileIO],
     *,
@@ -220,21 +242,7 @@ async def perform_multipart_upload(
     bin_hash_parts = [bytes.fromhex(etag) for etag in part_etags]
 
     expected_multipart_etag = hashlib.md5(b"".join(bin_hash_parts)).hexdigest() + f"-{len(part_etags)}"
-    resp = await ClientSessionRegistry.get_session().post(
-        completion_url, data=completion_body.encode("ascii"), skip_auto_headers=["content-type"]
-    )
-    if resp.status != 200:
-        try:
-            msg = await resp.text()
-        except Exception:
-            msg = "<no body>"
-        raise ExecutionError(f"Error when completing multipart upload: {resp.status}\n{msg}")
-    else:
-        response_body = await resp.text()
-        if expected_multipart_etag not in response_body:
-            raise ExecutionError(
-                f"Hash mismatch on multipart upload assembly: {expected_multipart_etag} not in {response_body}"
-            )
+    await _complete_multipart_upload(completion_url, completion_body, expected_multipart_etag)
 
 
 def get_content_length(data: BinaryIO) -> int:
