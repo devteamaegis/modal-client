@@ -9,6 +9,7 @@ from modal._utils.async_utils import synchronize_api
 from modal._utils.blob_utils import (
     MULTIPART_INFLIGHT_BYTES_MIN,
     _ByteBudget,
+    _complete_multipart_upload,
     _get_multipart_inflight_budget,
     blob_download as _blob_download,
     blob_upload as _blob_upload,
@@ -130,3 +131,51 @@ def test_get_multipart_inflight_budget_psutil_exception_fallback(monkeypatch, ex
 def test_sync(blob_server, client):
     # just tests that tests running blocking calls that upload to blob storage don't deadlock
     blob_upload(b"adsfadsf", client.stub)
+
+
+@pytest.mark.asyncio
+async def test_multipart_completion_retries_on_503(servicer, blob_server, client, monkeypatch):
+    """Verify that a transient S3 503 SlowDown on CompleteMultipartUpload is retried and the upload succeeds.
+
+    Previously, perform_multipart_upload posted to the completion URL with no retry logic, so a single
+    503 response would surface as an ExecutionError after potentially hours of part uploads (issue #3917).
+    """
+    import modal._utils.blob_utils as blob_utils_mod
+
+    call_count = 0
+    original_complete = _complete_multipart_upload.__wrapped__  # unwrapped for direct patching
+
+    async def flaky_complete(completion_url, completion_body, expected_etag):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise ExecutionError("Error when completing multipart upload: 503\n<SlowDown/>")
+        return await original_complete(completion_url, completion_body, expected_etag)
+
+    monkeypatch.setattr(blob_utils_mod, "_complete_multipart_upload", flaky_complete)
+
+    monkeypatch.setattr("modal._utils.blob_utils.DEFAULT_SEGMENT_CHUNK_SIZE", 128)
+    multipart_threshold = 1024
+    servicer.blob_multipart_threshold = multipart_threshold
+    data = random.randbytes(multipart_threshold * 4)
+    blob_id = await blob_upload.aio(data, client.stub)
+    assert await blob_download.aio(blob_id, client.stub) == data
+    assert call_count >= 2, "expected at least one 503-induced retry"
+
+
+@pytest.mark.asyncio
+async def test_multipart_completion_raises_after_max_retries(servicer, blob_server, client, monkeypatch):
+    """Verify that persistent S3 errors on the completion step are surfaced after retries are exhausted."""
+    import modal._utils.blob_utils as blob_utils_mod
+
+    async def always_fail(completion_url, completion_body, expected_etag):
+        raise ExecutionError("Error when completing multipart upload: 503\n<SlowDown/>")
+
+    monkeypatch.setattr(blob_utils_mod, "_complete_multipart_upload", always_fail)
+
+    monkeypatch.setattr("modal._utils.blob_utils.DEFAULT_SEGMENT_CHUNK_SIZE", 128)
+    multipart_threshold = 1024
+    servicer.blob_multipart_threshold = multipart_threshold
+    data = random.randbytes(multipart_threshold * 4)
+    with pytest.raises(ExecutionError, match="completing multipart upload"):
+        await blob_upload.aio(data, client.stub)
