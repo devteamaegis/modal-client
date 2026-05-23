@@ -212,3 +212,47 @@ def test_queue_create(servicer, client):
     Queue.objects.create(name="test-queue-create", allow_existing=True, client=client)
     with pytest.raises(InvalidError, match="Invalid Queue name"):
         Queue.objects.create(name="has space", client=client)
+
+
+def test_get_blocking_no_negative_timeout(servicer, client):
+    """Regression test: _get_blocking must not forward a negative timeout to the server.
+
+    When the caller's deadline expires between gRPC requests (e.g., the first
+    poll returned empty and the deadline has since elapsed), ``deadline - time.time()``
+    becomes negative.  Before this fix the negative value was forwarded verbatim
+    to ``QueueGetRequest(timeout=<negative>)``.  The correct behaviour is to detect
+    that the deadline has already elapsed and raise ``queue.Empty`` without
+    issuing another request.
+    """
+    from unittest.mock import patch
+
+    q = Queue.from_name("nonneg-timeout-test", create_if_missing=True)
+    q.hydrate(client)
+
+    # Capture every request timeout the mock servicer receives.
+    timeouts_sent: list[float] = []
+    original_QueueGet = type(servicer).QueueGet
+
+    async def recording_QueueGet(self_svc, stream):
+        from modal_proto import api_pb2
+
+        request: api_pb2.QueueGetRequest = await stream.recv_message()
+        timeouts_sent.append(request.timeout)
+        # Queue is empty – return no values immediately (ignore request.timeout so
+        # the test doesn't actually wait).
+        await stream.send_message(api_pb2.QueueGetResponse(values=[]))
+
+    type(servicer).QueueGet = recording_QueueGet
+    try:
+        # With timeout=0 the deadline is immediately expired; the fix ensures we
+        # raise queue.Empty without forwarding a negative (or zero) timeout.
+        with pytest.raises(queue.Empty):
+            q.get(block=True, timeout=0)
+    finally:
+        type(servicer).QueueGet = original_QueueGet
+
+    for t in timeouts_sent:
+        assert t >= 0, (
+            f"A non-positive timeout ({t!r}s) was forwarded to QueueGetRequest. "
+            "Negative timeouts must not be sent to the server."
+        )
