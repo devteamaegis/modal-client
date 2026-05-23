@@ -220,21 +220,31 @@ async def perform_multipart_upload(
     bin_hash_parts = [bytes.fromhex(etag) for etag in part_etags]
 
     expected_multipart_etag = hashlib.md5(b"".join(bin_hash_parts)).hexdigest() + f"-{len(part_etags)}"
+    await _complete_multipart_upload(completion_url, completion_body, expected_multipart_etag)
+
+
+@retry(n_attempts=5, base_delay=0.5, attempt_timeout=None)
+async def _complete_multipart_upload(completion_url: str, completion_body: str, expected_etag: str) -> None:
+    """POST the CompleteMultipartUpload request to S3, retrying on transient 503 SlowDown errors."""
     resp = await ClientSessionRegistry.get_session().post(
         completion_url, data=completion_body.encode("ascii"), skip_auto_headers=["content-type"]
     )
+    if resp.status == 503:
+        logger.debug("Received SlowDown signal from S3 on multipart completion, sleeping before retrying.")
+        await asyncio.sleep(1)
+
     if resp.status != 200:
         try:
             msg = await resp.text()
         except Exception:
             msg = "<no body>"
         raise ExecutionError(f"Error when completing multipart upload: {resp.status}\n{msg}")
-    else:
-        response_body = await resp.text()
-        if expected_multipart_etag not in response_body:
-            raise ExecutionError(
-                f"Hash mismatch on multipart upload assembly: {expected_multipart_etag} not in {response_body}"
-            )
+
+    response_body = await resp.text()
+    if expected_etag not in response_body:
+        raise ExecutionError(
+            f"Hash mismatch on multipart upload assembly: {expected_etag} not in {response_body}"
+        )
 
 
 def get_content_length(data: BinaryIO) -> int:
