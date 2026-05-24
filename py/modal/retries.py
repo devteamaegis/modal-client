@@ -131,12 +131,20 @@ class RetryManager:
     def _retry_delay_ms(attempt_count: int, retry_policy: api_pb2.FunctionRetryPolicy) -> float:
         """
         Computes the amount of time to sleep before retrying based on the backend_coefficient and initial_delay_ms args.
+
+        The delay is capped by ``retry_policy.max_delay_ms`` when that field is set (> 0), falling back to the
+        module-level ``MAX_INPUT_RETRY_DELAY_MS`` ceiling only for server-supplied policies that omit the field.
+        Previously the code always used ``MAX_INPUT_RETRY_DELAY_MS`` (24 hours), which caused the ``max_delay``
+        parameter of :class:`Retries` to be silently ignored by the client-side delay calculation.
         """
         if attempt_count < 1:
             raise ValueError(f"Cannot compute retry delay. attempt_count must be at least 1, but was {attempt_count}")
         delay_ms = retry_policy.initial_delay_ms * (retry_policy.backoff_coefficient ** (attempt_count - 1))
         if delay_ms < MIN_INPUT_RETRY_DELAY_MS:
             return MIN_INPUT_RETRY_DELAY_MS
-        if delay_ms > MAX_INPUT_RETRY_DELAY_MS:
-            return MAX_INPUT_RETRY_DELAY_MS
+        # Respect the policy's own max_delay_ms when it has been explicitly set;
+        # fall back to the absolute ceiling for policies that omit the field (value == 0).
+        effective_max = retry_policy.max_delay_ms if retry_policy.max_delay_ms > 0 else MAX_INPUT_RETRY_DELAY_MS
+        if delay_ms > effective_max:
+            return float(effective_max)
         return delay_ms
