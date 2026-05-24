@@ -489,7 +489,11 @@ class _Queue(_Object, type_prefix="qu"):
             request_timeout = 50.0  # We prevent longer ones in order to keep the connection alive
 
             if deadline is not None:
-                request_timeout = min(request_timeout, deadline - time.time())
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    # Deadline already passed before we could issue the next request.
+                    break
+                request_timeout = min(request_timeout, remaining)
 
             request = api_pb2.QueueGetRequest(
                 queue_id=self.object_id,

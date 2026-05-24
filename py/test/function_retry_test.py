@@ -148,6 +148,54 @@ def test_retry_delay_ms():
     assert RetryManager._retry_delay_ms(2, retry_policy) == 6000
 
 
+def test_retry_delay_ms_respects_max_delay_ms():
+    """Regression test: _retry_delay_ms must cap at retry_policy.max_delay_ms, not the global ceiling.
+
+    Previously the function always capped at MAX_INPUT_RETRY_DELAY_MS (24 hours), causing the
+    ``max_delay`` parameter of modal.Retries to be silently ignored by the client-side scheduler.
+    """
+    # With initial_delay=1s, backoff=2, max_delay=5s:
+    #   attempt 1 → 1000 ms  (below max_delay, returned as-is)
+    #   attempt 2 → 2000 ms  (below max_delay, returned as-is)
+    #   attempt 3 → 4000 ms  (below max_delay, returned as-is)
+    #   attempt 4 → 8000 ms  (exceeds max_delay_ms=5000, must be clamped to 5000)
+    policy = api_pb2.FunctionRetryPolicy(
+        retries=5,
+        backoff_coefficient=2.0,
+        initial_delay_ms=1000,
+        max_delay_ms=5000,
+    )
+    assert RetryManager._retry_delay_ms(1, policy) == 1000
+    assert RetryManager._retry_delay_ms(2, policy) == 2000
+    assert RetryManager._retry_delay_ms(3, policy) == 4000
+    # Without the fix this would return 8000 (unclamped exponential), not 5000.
+    assert RetryManager._retry_delay_ms(4, policy) == 5000
+    assert RetryManager._retry_delay_ms(10, policy) == 5000
+
+
+def test_retry_delay_ms_falls_back_to_global_ceiling_when_max_delay_unset():
+    """When max_delay_ms is 0 (proto default / server policy omits the field), use MAX_INPUT_RETRY_DELAY_MS."""
+    from modal.retries import MAX_INPUT_RETRY_DELAY_MS
+
+    policy_no_max = api_pb2.FunctionRetryPolicy(
+        retries=5,
+        backoff_coefficient=2.0,
+        initial_delay_ms=1000,
+        # max_delay_ms intentionally omitted → proto default 0
+    )
+    # At attempt 1 the computed delay (1000 ms) is well below both caps.
+    assert RetryManager._retry_delay_ms(1, policy_no_max) == 1000
+    # At a very high attempt count the delay should be capped at the global ceiling.
+    assert RetryManager._retry_delay_ms(100, policy_no_max) == MAX_INPUT_RETRY_DELAY_MS
+
+
+def test_retries_to_proto_sets_max_delay_ms():
+    """Ensure modal.Retries._to_proto() writes max_delay_ms so the scheduler can see it."""
+    retries = modal.Retries(max_retries=3, backoff_coefficient=2.0, initial_delay=1.0, max_delay=5.0)
+    proto = retries._to_proto()
+    assert proto.max_delay_ms == 5000
+
+
 def test_lost_inputs_retried(client, setup_app_and_function, servicer):
     servicer.sync_client_retries_enabled = True
     app, f = setup_app_and_function
